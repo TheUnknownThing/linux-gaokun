@@ -63,6 +63,9 @@ cp /usr/bin/qemu-aarch64-static  ${CHROOT_DIR}/usr/bin/qemu-aarch64-static
 
 # enable ParallelDownloads
 sed -i 's/#ParallelDownloads = 5/ParallelDownloads = 4/' ${CHROOT_DIR}/etc/pacman.conf
+sed -i 's/^DownloadUser = .*/DownloadUser = root/' ${CHROOT_DIR}/etc/pacman.conf
+sed -i 's/^#DisableSandboxFilesystem/DisableSandboxFilesystem/' ${CHROOT_DIR}/etc/pacman.conf
+sed -i 's/^#DisableSandboxSyscalls/DisableSandboxSyscalls/' ${CHROOT_DIR}/etc/pacman.conf
 echo "Server = $MIRROR_URL"'/$arch/$repo' >> ${CHROOT_DIR}/etc/pacman.d/mirrorlist
 
 # add my repo to install kernel and firmware
