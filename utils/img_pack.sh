@@ -30,7 +30,7 @@ fi
 
 # Pick a free loop device instead of assuming a fixed one exists.
 LOOP_DEV="$(losetup -f)"
-IMAGE_SIZE="${IMAGE_SIZE:-8G}"
+IMAGE_SIZE="${IMAGE_SIZE:-6G}"
 
 # container setup
 truncate -s "${IMAGE_SIZE}" archlinuxarm.img
@@ -134,5 +134,5 @@ rm ${CHROOT_DIR}/usr/bin/qemu-aarch64-static ${CHROOT_DIR}/root/*
 # umount
 umount -R ${CHROOT_DIR} && losetup -d ${LOOP_DEV}
 
-# compress, github release is limited to 2GB
-xz archlinuxarm.img
+# Compress with zstd to make CI finish faster. Use a single .zst artifact.
+zstd -T0 -19 --rm archlinuxarm.img
