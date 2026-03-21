@@ -96,7 +96,11 @@ curl https://raw.githubusercontent.com/right-0903/my_arch_auto_pack/refs/heads/m
 arch-chroot ${CHROOT_DIR} sh -c 'pacman-key --add /root/CA909D46CD1890BE.asc && pacman-key --lsign-key CA909D46CD1890BE'
 
 # Keep the stock kernel installed until the replacement kernel transaction succeeds.
-arch-chroot ${CHROOT_DIR} sh -c 'pacman -Syu efibootmgr grub linux-firmware-qcom wireless-regdb linux-gaokun3 linux-gaokun3-headers linux-firmware-gaokun3 iwd btrfs-progs --noconfirm'
+arch-chroot ${CHROOT_DIR} sh -c 'pacman -Syu efibootmgr grub wireless-regdb linux-gaokun3 linux-gaokun3-headers iwd btrfs-progs --noconfirm'
+
+# The custom firmware package overlaps with upstream qcom/atheros firmware files.
+arch-chroot ${CHROOT_DIR} sh -c 'pacman -Rdd --noconfirm linux-firmware-atheros linux-firmware-qcom || true'
+arch-chroot ${CHROOT_DIR} sh -c 'pacman -S linux-firmware-gaokun3 --noconfirm'
 
 # make a copy for this repo
 mv ${CHROOT_DIR}/var/cache/pacman/pkg/*.pkg.tar.zst .
