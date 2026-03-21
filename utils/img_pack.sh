@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 # =============================================================================
 # Filename: img_pack.sh
 # Purpose: To be filled
@@ -25,7 +26,7 @@ LOOP_DEV='/dev/loop7'
 
 # container setup
 dd of=archlinuxarm.img bs=1 seek=3G count=0
-losetup ${LOOP_DEV} archlinuxarm.img
+losetup -Pf ${LOOP_DEV} archlinuxarm.img
 parted ${LOOP_DEV} --script mklabel gpt
 parted ${LOOP_DEV} --script mkpart EFI fat32 1MiB 301MiB
 parted ${LOOP_DEV} --script set 1 boot on
@@ -35,12 +36,12 @@ mkfs.ext4 ${LOOP_DEV}p2
 
 # mount, extract rootfs and generate a mount table
 CHROOT_DIR='alarm-chroot'
-mkdir ${CHROOT_DIR}
+mkdir -p ${CHROOT_DIR}
 mount ${LOOP_DEV}p2 ${CHROOT_DIR}
 MIRROR_URL='http://fl.us.mirror.archlinuxarm.org'
-curl "$MIRROR_URL/os/ArchLinuxARM-aarch64-latest.tar.gz" > alarm.tar.gz
+curl -fsSL "$MIRROR_URL/os/ArchLinuxARM-aarch64-latest.tar.gz" -o alarm.tar.gz
 bsdtar -xpf alarm.tar.gz -C ${CHROOT_DIR}
-mkdir ${CHROOT_DIR}/boot/efi
+mkdir -p ${CHROOT_DIR}/boot/efi
 mount ${LOOP_DEV}p1 ${CHROOT_DIR}/boot/efi
 
 ###### dirty insert ######
@@ -83,36 +84,33 @@ arch-chroot ${CHROOT_DIR} sh -c 'pacman-key --init && pacman-key --populate arch
 curl https://raw.githubusercontent.com/right-0903/my_arch_auto_pack/refs/heads/main/keys/CA909D46CD1890BE.asc -o ${CHROOT_DIR}/root/CA909D46CD1890BE.asc
 arch-chroot ${CHROOT_DIR} sh -c 'pacman-key --add /root/CA909D46CD1890BE.asc && pacman-key --lsign-key CA909D46CD1890BE'
 
-# make life easier
-arch-chroot ${CHROOT_DIR} sh -c 'pacman -Rn linux-aarch64 --noconfirm'
-
-# update and install something needed, then clean immediately because of container space
-arch-chroot ${CHROOT_DIR} sh -c 'pacman -Syu efibootmgr grub linux-firmware-qcom wireless-regdb --noconfirm && rm /var/cache/pacman/pkg/*'
-
-arch-chroot ${CHROOT_DIR} sh -c 'pacman -S linux-gaokun3 linux-gaokun3-headers linux-firmware-gaokun3 --noconfirm'
-
-# add iwd to for wifi configuration, someone reported this, btrfs-progs for people using btrfs
-arch-chroot ${CHROOT_DIR} sh -c 'pacman -S iwd btrfs-progs --noconfirm'
+# Keep the stock kernel installed until the replacement kernel transaction succeeds.
+arch-chroot ${CHROOT_DIR} sh -c 'pacman -Syu efibootmgr grub linux-firmware-qcom wireless-regdb linux-gaokun3 linux-gaokun3-headers linux-firmware-gaokun3 iwd btrfs-progs --noconfirm'
 
 # make a copy for this repo
 mv ${CHROOT_DIR}/var/cache/pacman/pkg/*.pkg.tar.zst .
+rm -f ${CHROOT_DIR}/var/cache/pacman/pkg/*
 
 # use early KMS for debugging, this would give us log in the initramfs stage.
-sed -i 's/^\(MODULES=(\)/\1\nsimpledrm\nphy-qcom-snps-femto-v2/' ${CHROOT_DIR}/etc/mkinitcpio-gaokun3.conf
+if [[ -f ${CHROOT_DIR}/etc/mkinitcpio-gaokun3.conf ]]; then
+    sed -i 's/^\(MODULES=(\)/\1\nsimpledrm\nphy-qcom-snps-femto-v2/' ${CHROOT_DIR}/etc/mkinitcpio-gaokun3.conf
+elif [[ -f ${CHROOT_DIR}/etc/mkinitcpio.conf ]]; then
+    sed -i 's/^\(MODULES=(\)/\1\nsimpledrm\nphy-qcom-snps-femto-v2/' ${CHROOT_DIR}/etc/mkinitcpio.conf
+fi
 arch-chroot ${CHROOT_DIR} sh -c 'mkinitcpio -P'
 
 # install grub
-arch-chroot ${CHROOT_DIR} sh -c "grub-install ${LOOP_DEV}p1"
+arch-chroot ${CHROOT_DIR} sh -c 'grub-install --target=arm64-efi --efi-directory=/boot/efi --bootloader-id=arch --no-nvram --recheck'
 
 # fix efi loading
-arch-chroot ${CHROOT_DIR} sh -c 'mkdir /boot/efi/EFI/Boot && cp /boot/efi/EFI/arch/grubaa64.efi /boot/efi/EFI/Boot/bootaa64.efi'
+arch-chroot ${CHROOT_DIR} sh -c 'mkdir -p /boot/efi/EFI/Boot && cp /boot/efi/EFI/arch/grubaa64.efi /boot/efi/EFI/Boot/BOOTAA64.EFI'
 
 # set kernel commandline parameters
 sed -i 's/GRUB_CMDLINE_LINUX=""/GRUB_CMDLINE_LINUX="clk_ignore_unused pd_ignore_unused arm64.nopauth iommu.passthrough=0 iommu.strict=0 pcie_aspm.policy=powersupersave efi=noruntime modprobe.blacklist=msm"/' ${CHROOT_DIR}/etc/default/grub
 sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="loglevel=3 quiet"/GRUB_CMDLINE_LINUX_DEFAULT="fbcon=rotate:1 loglevel=3"/' ${CHROOT_DIR}/etc/default/grub
 
 # generate the grub config
-arch-chroot ${CHROOT_DIR} 'update-grub'
+arch-chroot ${CHROOT_DIR} sh -c 'grub-mkconfig -o /boot/grub/grub.cfg'
 
 # do clean
 rm ${CHROOT_DIR}/usr/bin/qemu-aarch64-static ${CHROOT_DIR}/root/*
