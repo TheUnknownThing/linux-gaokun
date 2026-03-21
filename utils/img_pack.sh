@@ -100,6 +100,7 @@ arch-chroot ${CHROOT_DIR} sh -c 'pacman -Syu efibootmgr grub wireless-regdb linu
 
 # The custom firmware package overlaps with upstream qcom/atheros firmware files.
 arch-chroot ${CHROOT_DIR} sh -c 'pacman -Rdd --noconfirm linux-firmware-atheros linux-firmware-qcom || true'
+arch-chroot ${CHROOT_DIR} sh -c 'rm -rf /usr/lib/firmware/ath11k/WCN6855/hw2.1'
 arch-chroot ${CHROOT_DIR} sh -c "pacman -S linux-firmware-gaokun3 --noconfirm --overwrite '/usr/lib/firmware/ath11k/WCN6855/*,/usr/lib/firmware/qca/*,/usr/lib/firmware/qcom/a660_*'"
 
 # make a copy for this repo
