@@ -30,9 +30,10 @@ fi
 
 # Pick a free loop device instead of assuming a fixed one exists.
 LOOP_DEV="$(losetup -f)"
+IMAGE_SIZE="${IMAGE_SIZE:-8G}"
 
 # container setup
-dd of=archlinuxarm.img bs=1 seek=3G count=0
+truncate -s "${IMAGE_SIZE}" archlinuxarm.img
 losetup -P ${LOOP_DEV} archlinuxarm.img
 parted ${LOOP_DEV} --script mklabel gpt
 parted ${LOOP_DEV} --script mkpart EFI fat32 1MiB 301MiB
