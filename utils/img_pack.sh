@@ -28,12 +28,12 @@ else
 fi
 
 
-# first serval loop device are taken up
-LOOP_DEV='/dev/loop7'
+# Pick a free loop device instead of assuming a fixed one exists.
+LOOP_DEV="$(losetup -f)"
 
 # container setup
 dd of=archlinuxarm.img bs=1 seek=3G count=0
-losetup -Pf ${LOOP_DEV} archlinuxarm.img
+losetup -P ${LOOP_DEV} archlinuxarm.img
 parted ${LOOP_DEV} --script mklabel gpt
 parted ${LOOP_DEV} --script mkpart EFI fat32 1MiB 301MiB
 parted ${LOOP_DEV} --script set 1 boot on
