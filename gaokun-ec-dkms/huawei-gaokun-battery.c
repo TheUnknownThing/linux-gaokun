@@ -213,11 +213,14 @@ static int gaokun_psy_get_bat_info(struct gaokun_psy *ecbat)
 					sizeof(ecbat->info), (u8 *)&ecbat->info);
 }
 
-static void gaokun_psy_update_bat_charge(struct gaokun_psy *ecbat)
+static int gaokun_psy_update_bat_charge(struct gaokun_psy *ecbat)
 {
 	u8 charge;
+	int ret;
 
-	gaokun_ec_psy_read_byte(ecbat->ec, EC_BAT_STATUS, &charge);
+	ret = gaokun_ec_psy_read_byte(ecbat->ec, EC_BAT_STATUS, &charge);
+	if (ret)
+		return ret;
 
 	switch (charge) {
 	case EC_BAT_CHARGING:
@@ -232,6 +235,8 @@ static void gaokun_psy_update_bat_charge(struct gaokun_psy *ecbat)
 	default:
 		dev_warn(ecbat->dev, "unknown charge state %d\n", charge);
 	}
+
+	return 0;
 }
 
 static int gaokun_psy_get_bat_status(struct gaokun_psy *ecbat)
@@ -243,13 +248,18 @@ static int gaokun_psy_get_bat_status(struct gaokun_psy *ecbat)
 			msecs_to_jiffies(CACHE_TIME)))
 		return 0;
 
-	gaokun_psy_update_bat_charge(ecbat);
+	ret = gaokun_psy_update_bat_charge(ecbat);
+	if (ret)
+		return ret;
+
 	ret = gaokun_ec_psy_multi_read(ecbat->ec, EC_BAT_STATUS_START,
-				       sizeof(ecbat->status), (u8 *)&ecbat->status);
+					       sizeof(ecbat->status), (u8 *)&ecbat->status);
+	if (ret)
+		return ret;
 
 	ecbat->update_time = jiffies;
 
-	return ret;
+	return 0;
 }
 
 static void gaokun_psy_init(struct gaokun_psy *ecbat)
@@ -274,6 +284,22 @@ static void gaokun_psy_init(struct gaokun_psy *ecbat)
 	ecbat->battery_model[14] = 'A'; /* FIX UP */
 }
 
+static bool
+gaokun_psy_bat_property_needs_status(enum power_supply_property psp)
+{
+	switch (psp) {
+	case POWER_SUPPLY_PROP_STATUS:
+	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
+	case POWER_SUPPLY_PROP_CURRENT_NOW:
+	case POWER_SUPPLY_PROP_CHARGE_FULL:
+	case POWER_SUPPLY_PROP_CHARGE_NOW:
+	case POWER_SUPPLY_PROP_CAPACITY:
+		return true;
+	default:
+		return false;
+	}
+}
+
 static int gaokun_psy_get_bat_property(struct power_supply *psy,
 				       enum power_supply_property psp,
 				       union power_supply_propval *val)
@@ -282,8 +308,12 @@ static int gaokun_psy_get_bat_property(struct power_supply *psy,
 	u8 buf[GAOKUN_SMART_CHARGE_DATA_SIZE];
 	int ret;
 
-	if (gaokun_psy_bat_present(ecbat))
-		gaokun_psy_get_bat_status(ecbat);
+	if (gaokun_psy_bat_present(ecbat) &&
+	    gaokun_psy_bat_property_needs_status(psp)) {
+		ret = gaokun_psy_get_bat_status(ecbat);
+		if (ret)
+			return ret;
+	}
 	else if (psp != POWER_SUPPLY_PROP_PRESENT)
 		return -ENODEV;
 
