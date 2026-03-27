@@ -325,7 +325,7 @@ static void gaokun_ucsi_altmode_notify_ind(struct gaokun_ucsi *uec)
 /*
  * When inserting, 2 UCSI events(connector change) are followed by USB events.
  * If we received one USB event, that means USB events are not blocked, so we
- * can complelte for all ports, and we should signal all events.
+ * can complete for all ports, and we should signal all events.
  */
 static void gaokun_ucsi_complete_usb_ack(struct gaokun_ucsi *uec)
 {
