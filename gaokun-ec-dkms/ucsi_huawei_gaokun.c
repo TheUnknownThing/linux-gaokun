@@ -10,6 +10,7 @@
 #include <linux/bitops.h>
 #include <linux/completion.h>
 #include <linux/container_of.h>
+#include <linux/mutex.h>
 #include <linux/module.h>
 #include <linux/notifier.h>
 #include <linux/of.h>
@@ -382,6 +383,30 @@ out:
 				     port_mask, first_ret);
 }
 
+static int gaokun_ucsi_refresh_ppm_locked(struct gaokun_ucsi *uec, u8 *port_mask)
+{
+	int ret;
+
+	/*
+	 * These EC register accesses are outside the normal UCSI core command
+	 * flow. Serialize them with the core's PPM lock so delayed altmode
+	 * recovery cannot collide with GET_CONNECTOR_STATUS and leave the
+	 * connector state stale after repeated plug/unplug cycles.
+	 */
+	mutex_lock(&uec->ucsi->ppm_lock);
+	ret = gaokun_ucsi_refresh(uec, port_mask);
+	mutex_unlock(&uec->ucsi->ppm_lock);
+
+	return ret;
+}
+
+static void gaokun_ucsi_ack_updates_ppm_locked(struct gaokun_ucsi *uec, u8 port_mask)
+{
+	mutex_lock(&uec->ucsi->ppm_lock);
+	gaokun_ucsi_ack_updates(uec, port_mask);
+	mutex_unlock(&uec->ucsi->ppm_lock);
+}
+
 static void gaokun_ucsi_altmode_notify_ind(struct gaokun_ucsi *uec,
 					   bool got_usb_event)
 {
@@ -398,11 +423,11 @@ static void gaokun_ucsi_altmode_notify_ind(struct gaokun_ucsi *uec,
 		 */
 		dev_warn_ratelimited(uec->dev,
 				     "ucsi connector is not initialized yet, acking pending event\n");
-		gaokun_ucsi_ack_updates(uec, 0);
+		gaokun_ucsi_ack_updates_ppm_locked(uec, 0);
 		return;
 	}
 
-	ret = gaokun_ucsi_refresh(uec, &port_mask);
+	ret = gaokun_ucsi_refresh_ppm_locked(uec, &port_mask);
 	if (ret)
 		return;
 
@@ -410,7 +435,7 @@ static void gaokun_ucsi_altmode_notify_ind(struct gaokun_ucsi *uec,
 		gaokun_ucsi_complete_usb_ack(uec, port_mask);
 
 	if (!port_mask) {
-		gaokun_ucsi_ack_updates(uec, 0);
+		gaokun_ucsi_ack_updates_ppm_locked(uec, 0);
 		return;
 	}
 
@@ -421,7 +446,7 @@ static void gaokun_ucsi_altmode_notify_ind(struct gaokun_ucsi *uec,
 		gaokun_ucsi_handle_altmode(&uec->ports[idx]);
 	}
 
-	gaokun_ucsi_ack_updates(uec, port_mask);
+	gaokun_ucsi_ack_updates_ppm_locked(uec, port_mask);
 }
 
 /*
