@@ -117,6 +117,7 @@ struct gaokun_ucsi {
 	u8 num_ports;
 	u8 register_retries;
 	unsigned long pending_usb_acks;
+	int last_connector_idx;
 	bool ports_initialized;
 	bool notifier_registered;
 	bool ucsi_registered;
@@ -412,6 +413,39 @@ static u8 gaokun_ucsi_pending_usb_mask(struct gaokun_ucsi *uec)
 	return port_mask;
 }
 
+static bool gaokun_ucsi_port_disconnected(struct gaokun_ucsi_port *port)
+{
+	enum gaokun_ucsi_ccx ccx;
+	enum gaokun_ucsi_mux mux;
+	u16 svid;
+	unsigned long flags;
+
+	spin_lock_irqsave(&port->lock, flags);
+	ccx = port->ccx;
+	mux = port->mux;
+	svid = port->svid;
+	spin_unlock_irqrestore(&port->lock, flags);
+
+	return ccx == USBC_CCX_NONE && mux == USBC_MUX_NONE && !svid;
+}
+
+static u8 gaokun_ucsi_infer_usb_complete_mask(struct gaokun_ucsi *uec)
+{
+	u8 pending_mask = gaokun_ucsi_pending_usb_mask(uec);
+	int idx = uec->last_connector_idx;
+
+	if (!pending_mask)
+		return 0;
+
+	if (hweight8(pending_mask) == 1)
+		return pending_mask;
+
+	if (idx >= 0 && idx < uec->num_ports && (pending_mask & BIT(idx)))
+		return BIT(idx);
+
+	return 0;
+}
+
 static void gaokun_ucsi_reschedule_usb_followups(struct gaokun_ucsi *uec,
 						 u8 port_mask)
 {
@@ -519,6 +553,7 @@ static void gaokun_ucsi_altmode_notify_ind(struct gaokun_ucsi *uec,
 					   bool defer_on_ppm_busy)
 {
 	u8 port_mask;
+	u8 complete_mask = 0;
 	int idx;
 	int ret;
 
@@ -567,8 +602,18 @@ static void gaokun_ucsi_altmode_notify_ind(struct gaokun_ucsi *uec,
 	gaokun_ucsi_trace(uec, "altmode notify refresh done: port_mask=%#x\n",
 			  port_mask);
 
-	if (got_usb_event)
-		gaokun_ucsi_complete_usb_ack(uec, port_mask);
+	if (got_usb_event) {
+		complete_mask = port_mask;
+		if (!complete_mask)
+			complete_mask = gaokun_ucsi_infer_usb_complete_mask(uec);
+		if (complete_mask != port_mask)
+			gaokun_ucsi_trace(uec,
+					  "usb follow-up inferred: refresh_mask=%#x complete_mask=%#x last_connector=%d pending_mask=%#x\n",
+					  port_mask, complete_mask,
+					  uec->last_connector_idx,
+					  gaokun_ucsi_pending_usb_mask(uec));
+		gaokun_ucsi_complete_usb_ack(uec, complete_mask);
+	}
 
 	if (!port_mask) {
 		gaokun_ucsi_ack_updates_ppm_locked(uec, 0);
@@ -650,6 +695,13 @@ static void gaokun_ucsi_handle_no_usb_event(struct work_struct *work)
 	if (!test_and_clear_bit(port->idx, &uec->pending_usb_acks))
 		return;
 
+	if (gaokun_ucsi_port_disconnected(port)) {
+		gaokun_ucsi_trace_rl(uec,
+				     "usb follow-up dropped for disconnected port=%d ts_ns=%llu\n",
+				     port->idx, GAOKUN_TRACE_TS_NS);
+		return;
+	}
+
 	dev_warn(uec->dev, "missing USB event for port %d after UCSI event\n",
 		 port->idx);
 	gaokun_ucsi_altmode_notify_ind(uec, false, false);
@@ -689,6 +741,7 @@ static int gaokun_ucsi_notify(struct notifier_block *nb,
 			}
 
 			port = &uec->ports[idx];
+			uec->last_connector_idx = idx;
 			set_bit(idx, &uec->pending_usb_acks);
 			mod_delayed_work(system_wq, &port->usb_work, 2 * HZ);
 			gaokun_ucsi_trace(uec,
@@ -861,6 +914,7 @@ static int gaokun_ucsi_probe(struct auxiliary_device *adev,
 	uec->ec = ec;
 	uec->dev = dev;
 	uec->version = UCSI_VERSION_1_0;
+	uec->last_connector_idx = GAOKUN_UCSI_NO_PORT_UPDATE;
 	uec->nb.notifier_call = gaokun_ucsi_notify;
 
 	INIT_DELAYED_WORK(&uec->work, gaokun_ucsi_register_worker);
