@@ -19,6 +19,7 @@
 #include <linux/usb/pd_vdo.h>
 #include <linux/usb/typec_altmode.h>
 #include <linux/usb/typec_dp.h>
+#include <linux/usb/typec_mux.h>
 #include <linux/workqueue_types.h>
 
 #include "ucsi.h"
@@ -94,6 +95,7 @@ struct gaokun_ucsi_port {
 
 	struct gaokun_ucsi *ucsi;
 	struct auxiliary_device *bridge;
+	struct typec_mux *typec_mux;
 
 	int idx;
 	enum gaokun_ucsi_ccx ccx;
@@ -367,17 +369,69 @@ static int gaokun_ucsi_refresh(struct gaokun_ucsi *uec, u8 *port_mask)
 static void gaokun_ucsi_handle_altmode(struct gaokun_ucsi_port *port)
 {
 	struct gaokun_ucsi *uec = port->ucsi;
+	struct typec_mux_state state = {};
+	struct typec_altmode dp_alt = {};
+	struct typec_displayport_data dp_data = {};
+	unsigned long flags;
+	u16 svid;
+	u8 mode;
+	u8 hpd_state;
+	u8 hpd_irq;
 	int idx = port->idx;
+	int ret;
 
 	if (idx >= uec->ucsi->cap.num_connectors) {
 		dev_warn(uec->dev, "altmode port out of range: %d\n", idx);
 		return;
 	}
 
+	spin_lock_irqsave(&port->lock, flags);
+	svid = port->svid;
+	mode = port->mode;
+	hpd_state = port->hpd_state;
+	hpd_irq = port->hpd_irq;
+	spin_unlock_irqrestore(&port->lock, flags);
+
+	if (port->typec_mux && svid == USB_SID_DISPLAYPORT) {
+		switch (mode) {
+		case DP_PIN_ASSIGN_C:
+			state.mode = TYPEC_DP_STATE_C;
+			break;
+		case DP_PIN_ASSIGN_D:
+			state.mode = TYPEC_DP_STATE_D;
+			break;
+		case DP_PIN_ASSIGN_E:
+			state.mode = TYPEC_DP_STATE_E;
+			break;
+		default:
+			state.mode = TYPEC_STATE_SAFE;
+			break;
+		}
+
+		dp_alt.svid = USB_TYPEC_DP_SID;
+		dp_alt.mode = USB_TYPEC_DP_MODE;
+		state.alt = &dp_alt;
+
+		dp_data.status = DP_STATUS_ENABLED;
+		if (hpd_state)
+			dp_data.status |= DP_STATUS_HPD_STATE;
+		if (hpd_irq)
+			dp_data.status |= DP_STATUS_IRQ_HPD;
+		dp_data.conf = DP_CONF_UFP_U_AS_UFP_D |
+			       DP_CONF_SET_PIN_ASSIGN(mode);
+		state.data = &dp_data;
+
+		ret = typec_mux_set(port->typec_mux, &state);
+		if (ret)
+			dev_warn(uec->dev,
+				 "failed to set typec mux for port %d: mode=0x%lx ret=%d\n",
+				 idx, state.mode, ret);
+	}
+
 	/* UCSI callback .connector_status() have set orientation */
 	if (port->bridge)
 		drm_aux_hpd_bridge_notify(&port->bridge->dev,
-					  port->hpd_state ?
+					  hpd_state ?
 					  connector_status_connected :
 					  connector_status_disconnected);
 }
@@ -814,6 +868,17 @@ static int gaokun_ucsi_ports_init(struct gaokun_ucsi *uec)
 			fwnode_handle_put(fwnode);
 			return PTR_ERR(ucsi_port->bridge);
 		}
+
+		ucsi_port->typec_mux = fwnode_typec_mux_get(fwnode);
+		if (IS_ERR(ucsi_port->typec_mux)) {
+			ret = PTR_ERR(ucsi_port->typec_mux);
+			if (ret == -ENODEV) {
+				ucsi_port->typec_mux = NULL;
+			} else {
+				fwnode_handle_put(fwnode);
+				return ret;
+			}
+		}
 	}
 
 	for (i = 0; i < num_ports; i++) {
@@ -954,8 +1019,10 @@ static void gaokun_ucsi_remove(struct auxiliary_device *adev)
 		gaokun_ec_unregister_notify(uec->ec, &uec->nb);
 	cancel_work_sync(&uec->usb_sync_work);
 	if (uec->ports_initialized) {
-		for (i = 0; i < uec->num_ports; i++)
+		for (i = 0; i < uec->num_ports; i++) {
 			cancel_delayed_work_sync(&uec->ports[i].usb_work);
+			typec_mux_put(uec->ports[i].typec_mux);
+		}
 	}
 	if (uec->ucsi_registered)
 		ucsi_unregister(uec->ucsi);
