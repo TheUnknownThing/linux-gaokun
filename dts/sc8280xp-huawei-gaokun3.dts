@@ -1320,6 +1320,7 @@
 	vdda-phy-supply = <&vreg_l3b>;
 	vdda-pll-supply = <&vreg_l4b>;
 
+	mode-switch;
 	orientation-switch;
 
 	status = "okay";

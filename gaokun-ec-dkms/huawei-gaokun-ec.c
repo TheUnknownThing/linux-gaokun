@@ -42,6 +42,7 @@
 #define EC_STANDBY_REG		0xB2
 #define EC_STANDBY_ENTER	0xDB
 #define EC_STANDBY_EXIT		0xEB
+#define GAOKUN_EC_MAX_EVENT_QUERIES	16
 #define GAOKUN_TRACE_TS_NS ((unsigned long long)ktime_get_mono_fast_ns())
 #define gaokun_ec_trace(ec, fmt, ...) \
 	dev_dbg(&(ec)->client->dev, "trace: " fmt, ##__VA_ARGS__)
@@ -726,42 +727,49 @@ static irqreturn_t gaokun_ec_irq_handler(int irq, void *data)
 	u8 ec_req[] = MKREQ(EC_EVENT, EC_QUERY, 0);
 	u8 status, id;
 	u64 ts_ns;
-	int ret;
+	int ret, queries;
 
 	ts_ns = GAOKUN_TRACE_TS_NS;
 	gaokun_ec_trace_rl(ec, "irq enter: irq=%d ts_ns=%llu\n", irq, ts_ns);
 
-	ret = gaokun_ec_read_byte(ec, ec_req, &id);
-	if (ret) {
-		gaokun_ec_trace_rl(ec,
-				   "irq query failed: irq=%d ts_ns=%llu ret=%d\n",
-				   irq, GAOKUN_TRACE_TS_NS, ret);
-		return IRQ_HANDLED;
+	for (queries = 0; queries < GAOKUN_EC_MAX_EVENT_QUERIES; queries++) {
+		ret = gaokun_ec_read_byte(ec, ec_req, &id);
+		if (ret) {
+			gaokun_ec_trace_rl(ec,
+					   "irq query failed: irq=%d ts_ns=%llu ret=%d\n",
+					   irq, GAOKUN_TRACE_TS_NS, ret);
+			return IRQ_HANDLED;
+		}
+
+		gaokun_ec_trace_rl(ec, "irq event id=%#x ts_ns=%llu\n", id,
+				   GAOKUN_TRACE_TS_NS);
+
+		switch (id) {
+		case 0x0: /* No more queued events */
+			return IRQ_HANDLED;
+
+		case EC_EVENT_LID:
+			gaokun_ec_psy_read_byte(ec, EC_LID_STATE, &status);
+			status &= EC_LID_OPEN;
+			input_report_switch(ec->idev, SW_LID, !status);
+			input_sync(ec->idev);
+			break;
+
+		default:
+			ts_ns = GAOKUN_TRACE_TS_NS;
+			gaokun_ec_trace(ec,
+					"irq notify begin: id=%#x ts_ns=%llu\n",
+					id, ts_ns);
+			blocking_notifier_call_chain(&ec->notifier_list, id, ec);
+			gaokun_ec_trace(ec,
+					"irq notify end: id=%#x ts_ns=%llu\n", id,
+					GAOKUN_TRACE_TS_NS);
+		}
 	}
 
-	gaokun_ec_trace_rl(ec, "irq event id=%#x ts_ns=%llu\n", id,
-			   GAOKUN_TRACE_TS_NS);
-
-	switch (id) {
-	case 0x0: /* No event */
-		break;
-
-	case EC_EVENT_LID:
-		gaokun_ec_psy_read_byte(ec, EC_LID_STATE, &status);
-		status &= EC_LID_OPEN;
-		input_report_switch(ec->idev, SW_LID, !status);
-		input_sync(ec->idev);
-		break;
-
-	default:
-		ts_ns = GAOKUN_TRACE_TS_NS;
-		gaokun_ec_trace(ec,
-				"irq notify begin: id=%#x ts_ns=%llu\n", id, ts_ns);
-		blocking_notifier_call_chain(&ec->notifier_list, id, ec);
-		gaokun_ec_trace(ec,
-				"irq notify end: id=%#x ts_ns=%llu\n", id,
-				GAOKUN_TRACE_TS_NS);
-	}
+	dev_warn_ratelimited(&ec->client->dev,
+			     "EC event queue did not drain after %d queries\n",
+			     GAOKUN_EC_MAX_EVENT_QUERIES);
 
 	return IRQ_HANDLED;
 }
