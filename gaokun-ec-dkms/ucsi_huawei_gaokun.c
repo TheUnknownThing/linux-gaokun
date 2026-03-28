@@ -112,6 +112,7 @@ struct gaokun_ucsi {
 	struct gaokun_ucsi_port *ports;
 	struct device *dev;
 	struct delayed_work work;
+	struct work_struct usb_sync_work;
 	struct notifier_block nb;
 	u16 version;
 	u8 num_ports;
@@ -398,6 +399,38 @@ static void gaokun_ucsi_complete_usb_ack(struct gaokun_ucsi *uec, u8 port_mask)
 	}
 }
 
+static u8 gaokun_ucsi_pending_usb_mask(struct gaokun_ucsi *uec)
+{
+	u8 port_mask = 0;
+	int idx;
+
+	for (idx = 0; idx < uec->num_ports; idx++) {
+		if (!completion_done(&uec->ports[idx].usb_ack))
+			port_mask |= BIT(idx);
+	}
+
+	return port_mask;
+}
+
+static void gaokun_ucsi_reschedule_usb_followups(struct gaokun_ucsi *uec,
+						 u8 port_mask)
+{
+	struct gaokun_ucsi_port *port;
+	int idx;
+
+	for (idx = 0; idx < uec->num_ports; idx++) {
+		if (!(port_mask & BIT(idx)))
+			continue;
+
+		port = &uec->ports[idx];
+		mod_delayed_work(system_wq, &port->usb_work, 2 * HZ);
+	}
+
+	gaokun_ucsi_trace(uec,
+			  "usb follow-up rescheduled: mask=%#x delay_jiffies=%u\n",
+			  port_mask, 2 * HZ);
+}
+
 static void gaokun_ucsi_ack_updates(struct gaokun_ucsi *uec, u8 port_mask)
 {
 	int first_ret = 0;
@@ -452,7 +485,8 @@ static void gaokun_ucsi_ack_updates_ppm_locked(struct gaokun_ucsi *uec, u8 port_
 }
 
 static void gaokun_ucsi_altmode_notify_ind(struct gaokun_ucsi *uec,
-					   bool got_usb_event)
+					   bool got_usb_event,
+					   bool defer_on_ppm_busy)
 {
 	u8 port_mask;
 	int idx;
@@ -474,7 +508,30 @@ static void gaokun_ucsi_altmode_notify_ind(struct gaokun_ucsi *uec,
 		return;
 	}
 
-	ret = gaokun_ucsi_refresh_ppm_locked(uec, &port_mask);
+	if (got_usb_event && defer_on_ppm_busy) {
+		if (!mutex_trylock(&uec->ucsi->ppm_lock)) {
+			port_mask = gaokun_ucsi_pending_usb_mask(uec);
+			/*
+			 * A real EC_EVENT_USB already arrived. If the UCSI core
+			 * is still holding ppm_lock for connector-change
+			 * handling, do not block the notifier thread here.
+			 * Extend the existing follow-up timers and let a worker
+			 * perform the same sideband sync once the core finishes.
+			 */
+			gaokun_ucsi_reschedule_usb_followups(uec, port_mask);
+			queue_work(system_wq, &uec->usb_sync_work);
+			gaokun_ucsi_trace_rl(uec,
+					     "altmode notify deferred: ts_ns=%llu pending_mask=%#x\n",
+					     GAOKUN_TRACE_TS_NS, port_mask);
+			return;
+		}
+
+		ret = gaokun_ucsi_refresh(uec, &port_mask);
+		mutex_unlock(&uec->ucsi->ppm_lock);
+	} else {
+		ret = gaokun_ucsi_refresh_ppm_locked(uec, &port_mask);
+	}
+
 	if (ret)
 		return;
 	gaokun_ucsi_trace(uec, "altmode notify refresh done: port_mask=%#x\n",
@@ -496,6 +553,16 @@ static void gaokun_ucsi_altmode_notify_ind(struct gaokun_ucsi *uec,
 	}
 
 	gaokun_ucsi_ack_updates_ppm_locked(uec, port_mask);
+}
+
+static void gaokun_ucsi_sync_deferred_usb(struct work_struct *work)
+{
+	struct gaokun_ucsi *uec = container_of(work, struct gaokun_ucsi,
+					       usb_sync_work);
+
+	gaokun_ucsi_trace_rl(uec, "deferred usb sync: ts_ns=%llu\n",
+			     GAOKUN_TRACE_TS_NS);
+	gaokun_ucsi_altmode_notify_ind(uec, true, false);
 }
 
 /*
@@ -520,7 +587,7 @@ static void gaokun_ucsi_handle_no_usb_event(struct work_struct *work)
 
 	dev_warn(uec->dev, "missing USB event for port %d after UCSI event\n",
 		 port->idx);
-	gaokun_ucsi_altmode_notify_ind(uec, false);
+	gaokun_ucsi_altmode_notify_ind(uec, false, false);
 }
 
 static int gaokun_ucsi_notify(struct notifier_block *nb,
@@ -535,7 +602,7 @@ static int gaokun_ucsi_notify(struct notifier_block *nb,
 	switch (action) {
 	case EC_EVENT_USB:
 		gaokun_ucsi_trace_rl(uec, "notifier EC_EVENT_USB\n");
-		gaokun_ucsi_altmode_notify_ind(uec, true);
+		gaokun_ucsi_altmode_notify_ind(uec, true, true);
 		return NOTIFY_OK;
 
 	case EC_EVENT_UCSI:
@@ -730,6 +797,7 @@ static int gaokun_ucsi_probe(struct auxiliary_device *adev,
 	uec->nb.notifier_call = gaokun_ucsi_notify;
 
 	INIT_DELAYED_WORK(&uec->work, gaokun_ucsi_register_worker);
+	INIT_WORK(&uec->usb_sync_work, gaokun_ucsi_sync_deferred_usb);
 
 	ret = gaokun_ucsi_ports_init(uec);
 	if (ret)
@@ -759,13 +827,13 @@ static void gaokun_ucsi_remove(struct auxiliary_device *adev)
 	int i;
 
 	cancel_delayed_work_sync(&uec->work);
+	if (uec->notifier_registered)
+		gaokun_ec_unregister_notify(uec->ec, &uec->nb);
+	cancel_work_sync(&uec->usb_sync_work);
 	if (uec->ports_initialized) {
 		for (i = 0; i < uec->num_ports; i++)
 			cancel_delayed_work_sync(&uec->ports[i].usb_work);
 	}
-
-	if (uec->notifier_registered)
-		gaokun_ec_unregister_notify(uec->ec, &uec->nb);
 	if (uec->ucsi_registered)
 		ucsi_unregister(uec->ucsi);
 	ucsi_destroy(uec->ucsi);

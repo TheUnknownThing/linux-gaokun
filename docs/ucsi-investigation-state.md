@@ -256,7 +256,61 @@ Patch the `EC_EVENT_USB` handling path in [`gaokun-ec-dkms/ucsi_huawei_gaokun.c`
 - it no longer blocks the notifier for multiple seconds in the same way
 - it still preserves the EC-side semantics needed to avoid event storms or stale EC state
 
-After that:
+## Phase 2 Narrow USB-Notifier Patch
+
+The next patch has now been applied locally on this branch in
+[`gaokun-ec-dkms/ucsi_huawei_gaokun.c`](/home/wano/playground/linux-gaokun/gaokun-ec-dkms/ucsi_huawei_gaokun.c).
+
+### What changed
+
+- Added a dedicated `usb_sync_work` item on `struct gaokun_ucsi`.
+- `EC_EVENT_USB` now tries `mutex_trylock(&uec->ucsi->ppm_lock)` first instead of unconditionally blocking in the notifier path.
+- If `ppm_lock` is immediately available, the driver keeps the old inline behavior and performs the sideband refresh normally.
+- If `ppm_lock` is busy:
+  - the notifier does **not** block waiting for the UCSI core
+  - outstanding per-port USB follow-up timers are re-armed for another `2 * HZ`
+  - a narrow deferred worker is queued to run the same sideband refresh after the core finishes
+- The timeout fallback path for genuinely missing USB follow-up events is unchanged.
+
+### Why this is different from the earlier unsafe worker experiment
+
+The older worker-based attempt was unsafe because it moved the whole USB-side sideband path out of the notifier unconditionally and therefore delayed EC-side progress too aggressively.
+
+This patch is intentionally narrower:
+
+- inline handling is still used whenever the notifier can take `ppm_lock` immediately
+- deferral happens only in the traced bad case, where the notifier would otherwise sit behind the UCSI core for seconds
+- per-port timeout workers are **not** completed early based on guesswork; they are only rescheduled so a real USB event does not immediately turn into a false `missing USB event` warning while the deferred sync is catching up
+
+### Current expectation for runtime testing
+
+If this patch is addressing the right failure point, the next instrumented run should show:
+
+- `EC_EVENT_USB` returns quickly instead of stalling for ~5 seconds
+- the new `altmode notify deferred` trace only when `ppm_lock` is actually busy
+- the deferred `deferred usb sync` trace shortly afterward
+- the earlier sequence
+  - `EC_EVENT_USB`
+  - long stall
+  - `missing USB event`
+  - `GET_CONNECTOR_STATUS failed (-110)`
+  should disappear or at least become much rarer
+
+### What this patch does **not** solve yet
+
+- DP mux/orientation routing is still intentionally untouched in this step
+- if DP still only works in one orientation, that remains a separate follow-up problem
+- if USB/DP alternation still fails after this change, the next likely focus is the remaining ACK path timing rather than the initial USB-event arrival itself
+
+### Build status
+
+The updated module still builds cleanly with:
+
+```sh
+make -C /lib/modules/$(uname -r)/build M=$PWD/gaokun-ec-dkms modules
+```
+
+### Next runtime check
 
 1. rebuild the modules
 2. reload them
