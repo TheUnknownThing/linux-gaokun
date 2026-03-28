@@ -10,6 +10,7 @@
 #include <linux/bitops.h>
 #include <linux/completion.h>
 #include <linux/container_of.h>
+#include <linux/ktime.h>
 #include <linux/mutex.h>
 #include <linux/module.h>
 #include <linux/notifier.h>
@@ -43,6 +44,11 @@
 	 GAOKUN_UCSI_BYTES_PER_PORT)
 
 #define CCX_TO_ORI(ccx) (++ccx % 3) /* convert ccx to enum typec_orientation */
+#define GAOKUN_TRACE_TS_NS ((unsigned long long)ktime_get_mono_fast_ns())
+#define gaokun_ucsi_trace(uec, fmt, ...) \
+	dev_dbg((uec)->dev, "trace: " fmt, ##__VA_ARGS__)
+#define gaokun_ucsi_trace_rl(uec, fmt, ...) \
+	dev_dbg_ratelimited((uec)->dev, "trace: " fmt, ##__VA_ARGS__)
 
 /* Configuration Channel Extension */
 enum gaokun_ucsi_ccx {
@@ -182,14 +188,23 @@ static void gaokun_ucsi_update_connector(struct ucsi_connector *con)
 static void gaokun_set_orientation(struct ucsi_connector *con,
 				   struct gaokun_ucsi_port *port)
 {
+	struct gaokun_ucsi *uec = port->ucsi;
 	enum gaokun_ucsi_ccx ccx;
+	enum gaokun_ucsi_ccx raw_ccx;
+	enum typec_orientation orientation;
 	unsigned long flags;
+	int ret;
 
 	spin_lock_irqsave(&port->lock, flags);
 	ccx = port->ccx;
 	spin_unlock_irqrestore(&port->lock, flags);
 
-	typec_set_orientation(con->port, CCX_TO_ORI(ccx));
+	raw_ccx = ccx;
+	orientation = CCX_TO_ORI(ccx);
+	ret = typec_set_orientation(con->port, orientation);
+	gaokun_ucsi_trace_rl(uec,
+			     "set orientation: con=%d port=%d ccx=%u orientation=%u ret=%d\n",
+			     con->num, port->idx, raw_ccx, orientation, ret);
 }
 
 static void gaokun_ucsi_connector_status(struct ucsi_connector *con)
@@ -226,6 +241,12 @@ static void gaokun_ucsi_port_update(struct gaokun_ucsi_port *port,
 	struct gaokun_ucsi *uec = port->ucsi;
 	int offset = port->idx * GAOKUN_UCSI_BYTES_PER_PORT;
 	unsigned long flags;
+	enum gaokun_ucsi_ccx ccx;
+	enum gaokun_ucsi_mux mux;
+	u8 mode;
+	u16 svid;
+	u8 hpd_state;
+	u8 hpd_irq;
 	u8 dcc, ddi;
 
 	dcc = port_data[offset];
@@ -278,7 +299,19 @@ static void gaokun_ucsi_port_update(struct gaokun_ucsi_port *port,
 		break;
 	}
 
+	ccx = port->ccx;
+	mux = port->mux;
+	mode = port->mode;
+	svid = port->svid;
+	hpd_state = port->hpd_state;
+	hpd_irq = port->hpd_irq;
+
 	spin_unlock_irqrestore(&port->lock, flags);
+
+	gaokun_ucsi_trace(uec,
+			  "port snapshot: port=%d raw_dcc=%#x raw_ddi=%#x ccx=%u mux=%u mode=%u svid=%#x hpd_state=%u hpd_irq=%u\n",
+			  port->idx, dcc, ddi, ccx, mux, mode, svid,
+			  hpd_state, hpd_irq);
 }
 
 static u8 gaokun_ucsi_valid_port_mask(const struct gaokun_ucsi *uec)
@@ -299,6 +332,11 @@ static int gaokun_ucsi_refresh(struct gaokun_ucsi *uec, u8 *port_mask)
 	if (ret)
 		return ret;
 
+	gaokun_ucsi_trace(uec,
+			  "refresh reg: ts_ns=%llu ec_num_ports=%u ec_port_updt=%#x checksum=%#x\n",
+			  GAOKUN_TRACE_TS_NS, ureg.num_ports, ureg.port_updt,
+			  ureg.checksum);
+
 	if (ureg.num_ports != uec->num_ports)
 		dev_warn_ratelimited(uec->dev, "EC reported %u ports, expected %u\n",
 				     ureg.num_ports, uec->num_ports);
@@ -318,6 +356,8 @@ static int gaokun_ucsi_refresh(struct gaokun_ucsi *uec, u8 *port_mask)
 	}
 
 	*port_mask = updates;
+	gaokun_ucsi_trace(uec, "refresh updates mask=%#x valid_mask=%#x\n",
+			  updates, valid_mask);
 
 	return 0;
 }
@@ -351,6 +391,10 @@ static void gaokun_ucsi_complete_usb_ack(struct gaokun_ucsi *uec, u8 port_mask)
 			continue;
 		if (!completion_done(&port->usb_ack))
 			complete_all(&port->usb_ack);
+		gaokun_ucsi_trace(uec,
+				  "usb follow-up complete: port=%d mask=%#x now_done=%d\n",
+				  port->idx, port_mask,
+				  completion_done(&port->usb_ack));
 	}
 }
 
@@ -414,6 +458,9 @@ static void gaokun_ucsi_altmode_notify_ind(struct gaokun_ucsi *uec,
 	int idx;
 	int ret;
 
+	gaokun_ucsi_trace_rl(uec, "altmode notify: ts_ns=%llu got_usb_event=%d\n",
+			     GAOKUN_TRACE_TS_NS, got_usb_event);
+
 	if (!uec->ucsi_registered || !uec->ucsi->connector) {
 		/*
 		 * On MateBook E Go, early EC/UCSI activity indirectly shares
@@ -430,6 +477,8 @@ static void gaokun_ucsi_altmode_notify_ind(struct gaokun_ucsi *uec,
 	ret = gaokun_ucsi_refresh_ppm_locked(uec, &port_mask);
 	if (ret)
 		return;
+	gaokun_ucsi_trace(uec, "altmode notify refresh done: port_mask=%#x\n",
+			  port_mask);
 
 	if (got_usb_event)
 		gaokun_ucsi_complete_usb_ack(uec, port_mask);
@@ -462,6 +511,10 @@ static void gaokun_ucsi_handle_no_usb_event(struct work_struct *work)
 	port = container_of(to_delayed_work(work), struct gaokun_ucsi_port,
 			    usb_work);
 	uec = port->ucsi;
+	gaokun_ucsi_trace_rl(uec,
+			     "usb follow-up worker fired: ts_ns=%llu port=%d done=%d\n",
+			     GAOKUN_TRACE_TS_NS, port->idx,
+			     completion_done(&port->usb_ack));
 	if (completion_done(&port->usb_ack))
 		return;
 
@@ -476,14 +529,20 @@ static int gaokun_ucsi_notify(struct notifier_block *nb,
 	u32 cci;
 	struct gaokun_ucsi *uec = container_of(nb, struct gaokun_ucsi, nb);
 
+	gaokun_ucsi_trace_rl(uec, "notifier action=%#lx ts_ns=%llu\n",
+			     action, GAOKUN_TRACE_TS_NS);
+
 	switch (action) {
 	case EC_EVENT_USB:
+		gaokun_ucsi_trace_rl(uec, "notifier EC_EVENT_USB\n");
 		gaokun_ucsi_altmode_notify_ind(uec, true);
 		return NOTIFY_OK;
 
 	case EC_EVENT_UCSI:
 		if (gaokun_ucsi_read_cci(uec->ucsi, &cci))
 			return NOTIFY_BAD;
+		gaokun_ucsi_trace_rl(uec, "notifier EC_EVENT_UCSI cci=%#x connector=%lu\n",
+				     cci, UCSI_CCI_CONNECTOR(cci));
 		ucsi_notify_common(uec->ucsi, cci);
 		if (UCSI_CCI_CONNECTOR(cci)) {
 			struct gaokun_ucsi_port *port;
@@ -498,6 +557,9 @@ static int gaokun_ucsi_notify(struct notifier_block *nb,
 			port = &uec->ports[idx];
 			reinit_completion(&port->usb_ack);
 			mod_delayed_work(system_wq, &port->usb_work, 2 * HZ);
+			gaokun_ucsi_trace(uec,
+					  "usb follow-up armed: port=%u delay_jiffies=%u\n",
+					  idx, 2 * HZ);
 		}
 
 		return NOTIFY_OK;

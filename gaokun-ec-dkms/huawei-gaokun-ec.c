@@ -13,6 +13,7 @@
 #include <linux/hwmon-sysfs.h>
 #include <linux/i2c.h>
 #include <linux/input.h>
+#include <linux/ktime.h>
 #include <linux/notifier.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -41,6 +42,11 @@
 #define EC_STANDBY_REG		0xB2
 #define EC_STANDBY_ENTER	0xDB
 #define EC_STANDBY_EXIT		0xEB
+#define GAOKUN_TRACE_TS_NS ((unsigned long long)ktime_get_mono_fast_ns())
+#define gaokun_ec_trace(ec, fmt, ...) \
+	dev_dbg(&(ec)->client->dev, "trace: " fmt, ##__VA_ARGS__)
+#define gaokun_ec_trace_rl(ec, fmt, ...) \
+	dev_dbg_ratelimited(&(ec)->client->dev, "trace: " fmt, ##__VA_ARGS__)
 
 enum gaokun_ec_smart_charge_cmd {
 	SMART_CHARGE_DATA_WRITE = 0xE3,
@@ -719,11 +725,22 @@ static irqreturn_t gaokun_ec_irq_handler(int irq, void *data)
 	struct gaokun_ec *ec = data;
 	u8 ec_req[] = MKREQ(EC_EVENT, EC_QUERY, 0);
 	u8 status, id;
+	u64 ts_ns;
 	int ret;
 
+	ts_ns = GAOKUN_TRACE_TS_NS;
+	gaokun_ec_trace_rl(ec, "irq enter: irq=%d ts_ns=%llu\n", irq, ts_ns);
+
 	ret = gaokun_ec_read_byte(ec, ec_req, &id);
-	if (ret)
+	if (ret) {
+		gaokun_ec_trace_rl(ec,
+				   "irq query failed: irq=%d ts_ns=%llu ret=%d\n",
+				   irq, GAOKUN_TRACE_TS_NS, ret);
 		return IRQ_HANDLED;
+	}
+
+	gaokun_ec_trace_rl(ec, "irq event id=%#x ts_ns=%llu\n", id,
+			   GAOKUN_TRACE_TS_NS);
 
 	switch (id) {
 	case 0x0: /* No event */
@@ -737,7 +754,13 @@ static irqreturn_t gaokun_ec_irq_handler(int irq, void *data)
 		break;
 
 	default:
+		ts_ns = GAOKUN_TRACE_TS_NS;
+		gaokun_ec_trace(ec,
+				"irq notify begin: id=%#x ts_ns=%llu\n", id, ts_ns);
 		blocking_notifier_call_chain(&ec->notifier_list, id, ec);
+		gaokun_ec_trace(ec,
+				"irq notify end: id=%#x ts_ns=%llu\n", id,
+				GAOKUN_TRACE_TS_NS);
 	}
 
 	return IRQ_HANDLED;
