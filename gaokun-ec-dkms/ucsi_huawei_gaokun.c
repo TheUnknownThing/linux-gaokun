@@ -391,8 +391,14 @@ static int gaokun_ucsi_ports_init(struct gaokun_ucsi *uec)
 	int i, ret, num_ports;
 	u32 port;
 
-	gaokun_ec_ucsi_get_reg(uec->ec, &ureg);
+	ret = gaokun_ec_ucsi_get_reg(uec->ec, &ureg);
+	if (ret)
+		return dev_err_probe(dev, ret, "failed to read UCSI registers\n");
+
 	num_ports = ureg.num_ports;
+	if (num_ports <= 0)
+		return dev_err_probe(dev, -ENODEV, "EC reported no UCSI ports\n");
+
 	uec->ports = devm_kcalloc(dev, num_ports, sizeof(*(uec->ports)),
 				  GFP_KERNEL);
 	if (!uec->ports)
