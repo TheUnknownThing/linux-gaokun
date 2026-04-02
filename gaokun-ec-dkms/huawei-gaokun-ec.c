@@ -120,6 +120,7 @@ struct gaokun_ec {
 	struct blocking_notifier_head notifier_list;
 	struct device *hwmon_dev;
 	struct input_dev *idev;
+	bool pm_transition;
 	bool suspended;
 };
 
@@ -621,15 +622,36 @@ static const struct hwmon_chip_info gaokun_ec_hwmon_chip_info = {
 static int gaokun_ec_suspend(struct device *dev)
 {
 	struct gaokun_ec *ec = dev_get_drvdata(dev);
+	struct i2c_client *client = ec->client;
 	u8 ec_req[] = MKREQ(0x02, EC_STANDBY_REG, 1, EC_STANDBY_ENTER);
 	int ret;
+	int i;
 
 	if (ec->suspended)
 		return 0;
 
-	ret = gaokun_ec_write(ec, ec_req);
-	if (ret)
+	/*
+	 * With DP Alt Mode active the EC can still be busy delivering sideband
+	 * events while suspend is being entered. Give the standby transaction a
+	 * short retry window instead of failing the whole suspend sequence on the
+	 * first timeout.
+	 */
+	ec->pm_transition = true;
+	disable_irq(client->irq);
+
+	for (i = 0; i < 3; ++i) {
+		ret = gaokun_ec_write(ec, ec_req);
+		if (ret == 0)
+			break;
+
+		msleep(100);
+	}
+
+	if (ret) {
+		enable_irq(client->irq);
+		ec->pm_transition = false;
 		return ret;
+	}
 
 	ec->suspended = true;
 
@@ -639,6 +661,7 @@ static int gaokun_ec_suspend(struct device *dev)
 static int gaokun_ec_resume(struct device *dev)
 {
 	struct gaokun_ec *ec = dev_get_drvdata(dev);
+	struct i2c_client *client = ec->client;
 	u8 ec_req[] = MKREQ(0x02, EC_STANDBY_REG, 1, EC_STANDBY_EXIT);
 	int ret;
 	int i;
@@ -654,10 +677,15 @@ static int gaokun_ec_resume(struct device *dev)
 		msleep(100); /* EC need time to resume */
 	}
 
-	if (ret)
+	if (ret) {
+		enable_irq(client->irq);
+		ec->pm_transition = false;
 		return ret;
+	}
 
 	ec->suspended = false;
+	ec->pm_transition = false;
+	enable_irq(client->irq);
 
 	return 0;
 }
@@ -739,6 +767,8 @@ static irqreturn_t gaokun_ec_irq_handler(int irq, void *data)
 			break;
 
 		default:
+			if (ec->pm_transition)
+				break;
 			blocking_notifier_call_chain(&ec->notifier_list, id, ec);
 		}
 	}
@@ -817,7 +847,12 @@ static const struct of_device_id gaokun_ec_of_match[] = {
 MODULE_DEVICE_TABLE(of, gaokun_ec_of_match);
 
 static const struct dev_pm_ops gaokun_ec_pm_ops = {
-	NOIRQ_SYSTEM_SLEEP_PM_OPS(gaokun_ec_suspend, gaokun_ec_resume)
+	/*
+	 * The EC standby transaction uses interrupt-driven GENI I2C transfers, so
+	 * it must complete before the NOIRQ phase. Quiesce the EC IRQ explicitly
+	 * around the transfer instead of relying on noirq PM hooks.
+	 */
+	SYSTEM_SLEEP_PM_OPS(gaokun_ec_suspend, gaokun_ec_resume)
 };
 
 static struct i2c_driver gaokun_ec_driver = {
