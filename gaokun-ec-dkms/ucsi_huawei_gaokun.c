@@ -77,6 +77,7 @@ struct gaokun_ucsi_reg {
 
 struct gaokun_ucsi_port {
 	struct completion usb_ack;
+	struct delayed_work usb_work;
 	spinlock_t lock; /* serializing port resource access */
 
 	struct gaokun_ucsi *ucsi;
@@ -346,15 +347,20 @@ static void gaokun_ucsi_complete_usb_ack(struct gaokun_ucsi *uec)
  * UCSI event, if not after timeout(this notify may be disabled somehow),
  * then force to enable altmode.
  */
-static void gaokun_ucsi_handle_no_usb_event(struct gaokun_ucsi *uec, int idx)
+static void gaokun_ucsi_handle_no_usb_event(struct work_struct *work)
 {
 	struct gaokun_ucsi_port *port;
+	struct gaokun_ucsi *uec;
 
-	port = &uec->ports[idx];
-	if (!wait_for_completion_timeout(&port->usb_ack, 2 * HZ)) {
-		dev_warn(uec->dev, "No USB EVENT, triggered by UCSI EVENT");
-		gaokun_ucsi_altmode_notify_ind(uec);
-	}
+	port = container_of(to_delayed_work(work), struct gaokun_ucsi_port,
+			    usb_work);
+	uec = port->ucsi;
+	if (completion_done(&port->usb_ack))
+		return;
+
+	dev_warn(uec->dev, "missing USB event for port %d after UCSI event\n",
+		 port->idx);
+	gaokun_ucsi_altmode_notify_ind(uec);
 }
 
 static int gaokun_ucsi_notify(struct notifier_block *nb,
@@ -372,8 +378,13 @@ static int gaokun_ucsi_notify(struct notifier_block *nb,
 	case EC_EVENT_UCSI:
 		gaokun_ucsi_read_cci(uec->ucsi, &cci);
 		ucsi_notify_common(uec->ucsi, cci);
-		if (UCSI_CCI_CONNECTOR(cci))
-			gaokun_ucsi_handle_no_usb_event(uec, UCSI_CCI_CONNECTOR(cci) - 1);
+		if (UCSI_CCI_CONNECTOR(cci)) {
+			struct gaokun_ucsi_port *port;
+
+			port = &uec->ports[UCSI_CCI_CONNECTOR(cci) - 1];
+			reinit_completion(&port->usb_ack);
+			mod_delayed_work(system_wq, &port->usb_work, 2 * HZ);
+		}
 
 		return NOTIFY_OK;
 
@@ -410,6 +421,8 @@ static int gaokun_ucsi_ports_init(struct gaokun_ucsi *uec)
 		ucsi_port->idx = i;
 		ucsi_port->ucsi = uec;
 		init_completion(&ucsi_port->usb_ack);
+		INIT_DELAYED_WORK(&ucsi_port->usb_work,
+				  gaokun_ucsi_handle_no_usb_event);
 		spin_lock_init(&ucsi_port->lock);
 	}
 
@@ -511,8 +524,11 @@ static int gaokun_ucsi_probe(struct auxiliary_device *adev,
 static void gaokun_ucsi_remove(struct auxiliary_device *adev)
 {
 	struct gaokun_ucsi *uec = auxiliary_get_drvdata(adev);
+	int i;
 
 	cancel_delayed_work_sync(&uec->work);
+	for (i = 0; i < uec->num_ports; i++)
+		cancel_delayed_work_sync(&uec->ports[i].usb_work);
 
 	if (uec->notifier_registered)
 		gaokun_ec_unregister_notify(uec->ec, &uec->nb);
