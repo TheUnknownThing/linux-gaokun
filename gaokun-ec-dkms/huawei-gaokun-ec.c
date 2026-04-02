@@ -456,10 +456,10 @@ EXPORT_SYMBOL_GPL(gaokun_ec_ucsi_get_reg);
 int gaokun_ec_ucsi_pan_ack(struct gaokun_ec *ec, int port_id)
 {
 	u8 ec_req[] = MKREQ(0x03, UCSI_REG_WRITE, 1);
-	u8 data = 1 << port_id;
+	u8 data = 0;
 
-	if (port_id == GAOKUN_UCSI_NO_PORT_UPDATE)
-		data = 0;
+	if (port_id != GAOKUN_UCSI_NO_PORT_UPDATE)
+		data = BIT(port_id);
 
 	refill_req_byte(ec_req, &data);
 
