@@ -3,6 +3,7 @@
 #ifndef __DRIVER_USB_TYPEC_UCSI_H
 #define __DRIVER_USB_TYPEC_UCSI_H
 
+#include <linux/bitmap.h>
 #include <linux/bitops.h>
 #include <linux/completion.h>
 #include <linux/device.h>
@@ -61,6 +62,7 @@ struct dentry;
  * struct ucsi_operations - UCSI I/O operations
  * @read_version: Read implemented UCSI version
  * @read_cci: Read CCI register
+ * @poll_cci: Poll CCI register until condition is met
  * @read_message_in: Read message data from UCSI
  * @sync_control: Blocking control operation
  * @async_control: Non-blocking control operation
@@ -75,11 +77,13 @@ struct dentry;
 struct ucsi_operations {
 	int (*read_version)(struct ucsi *ucsi, u16 *version);
 	int (*read_cci)(struct ucsi *ucsi, u32 *cci);
+	int (*poll_cci)(struct ucsi *ucsi, u32 *cci);
 	int (*read_message_in)(struct ucsi *ucsi, void *val, size_t val_len);
-	int (*sync_control)(struct ucsi *ucsi, u64 command);
+	int (*sync_control)(struct ucsi *ucsi, u64 command,
+			    const void *data, size_t size);
 	int (*async_control)(struct ucsi *ucsi, u64 command);
 	bool (*update_altmodes)(struct ucsi *ucsi, struct ucsi_altmode *orig,
-				struct ucsi_altmode *updated);
+				struct ucsi_altmode *updated, int recipient);
 	void (*update_connector)(struct ucsi_connector *con);
 	void (*connector_status)(struct ucsi_connector *con);
 };
@@ -410,6 +414,7 @@ struct ucsi {
 #define UCSI_MAX_ALTMODES	(UCSI_MAX_SVID * 6)
 
 #define UCSI_TYPEC_VSAFE5V	5000
+#define UCSI_TYPEC_CURRENT_DEFAULT	900
 #define UCSI_TYPEC_1_5_CURRENT	1500
 #define UCSI_TYPEC_3_0_CURRENT	3000
 
@@ -434,13 +439,15 @@ struct ucsi_connector {
 
 	struct typec_capability typec_cap;
 
-	struct ucsi_connector_status status;
-	struct ucsi_connector_capability cap;
+	DECLARE_BITMAP(status, 9 * BITS_PER_BYTE);
+	DECLARE_BITMAP(cap, 24 * BITS_PER_BYTE);
 	struct power_supply *psy;
 	struct power_supply_desc psy_desc;
 	u32 rdo;
+	u32 vbus_voltage;
 	u32 src_pdos[PDO_MAX_OBJECTS];
-	int num_pdos;
+	u16 num_pdos;
+	u16 max_pdos;
 
 	/* USB PD objects */
 	struct usb_power_delivery *pd;
@@ -464,7 +471,8 @@ void ucsi_altmode_update_active(struct ucsi_connector *con);
 int ucsi_resume(struct ucsi *ucsi);
 
 void ucsi_notify_common(struct ucsi *ucsi, u32 cci);
-int ucsi_sync_control_common(struct ucsi *ucsi, u64 command);
+int ucsi_sync_control_common(struct ucsi *ucsi, u64 command,
+			     const void *data, size_t size);
 
 #if IS_ENABLED(CONFIG_POWER_SUPPLY)
 int ucsi_register_port_psy(struct ucsi_connector *con);
