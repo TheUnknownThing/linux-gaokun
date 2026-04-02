@@ -100,6 +100,8 @@ struct gaokun_ucsi {
 	struct notifier_block nb;
 	u16 version;
 	u8 num_ports;
+	bool notifier_registered;
+	bool ucsi_registered;
 };
 
 /* -------------------------------------------------------------------------- */
@@ -452,10 +454,16 @@ static void gaokun_ucsi_register_worker(struct work_struct *work)
 		dev_err_probe(ucsi->dev, ret, "notifier register failed\n");
 		return;
 	}
+	uec->notifier_registered = true;
 
 	ret = ucsi_register(ucsi);
-	if (ret)
+	if (ret) {
+		gaokun_ec_unregister_notify(uec->ec, &uec->nb);
+		uec->notifier_registered = false;
 		dev_err_probe(ucsi->dev, ret, "ucsi register failed\n");
+		return;
+	}
+	uec->ucsi_registered = true;
 }
 
 static int gaokun_ucsi_probe(struct auxiliary_device *adev,
@@ -498,8 +506,12 @@ static void gaokun_ucsi_remove(struct auxiliary_device *adev)
 {
 	struct gaokun_ucsi *uec = auxiliary_get_drvdata(adev);
 
-	gaokun_ec_unregister_notify(uec->ec, &uec->nb);
-	ucsi_unregister(uec->ucsi);
+	cancel_delayed_work_sync(&uec->work);
+
+	if (uec->notifier_registered)
+		gaokun_ec_unregister_notify(uec->ec, &uec->nb);
+	if (uec->ucsi_registered)
+		ucsi_unregister(uec->ucsi);
 	ucsi_destroy(uec->ucsi);
 }
 
