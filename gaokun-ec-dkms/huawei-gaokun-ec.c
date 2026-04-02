@@ -41,6 +41,7 @@
 #define EC_STANDBY_REG		0xB2
 #define EC_STANDBY_ENTER	0xDB
 #define EC_STANDBY_EXIT		0xEB
+#define GAOKUN_EC_MAX_EVENT_QUERIES	16
 
 enum gaokun_ec_smart_charge_cmd {
 	SMART_CHARGE_DATA_WRITE = 0xE3,
@@ -719,26 +720,32 @@ static irqreturn_t gaokun_ec_irq_handler(int irq, void *data)
 	struct gaokun_ec *ec = data;
 	u8 ec_req[] = MKREQ(EC_EVENT, EC_QUERY, 0);
 	u8 status, id;
-	int ret;
+	int ret, queries;
 
-	ret = gaokun_ec_read_byte(ec, ec_req, &id);
-	if (ret)
-		return IRQ_HANDLED;
+	for (queries = 0; queries < GAOKUN_EC_MAX_EVENT_QUERIES; queries++) {
+		ret = gaokun_ec_read_byte(ec, ec_req, &id);
+		if (ret)
+			return IRQ_HANDLED;
 
-	switch (id) {
-	case 0x0: /* No event */
-		break;
+		switch (id) {
+		case 0x0: /* No more queued events */
+			return IRQ_HANDLED;
 
-	case EC_EVENT_LID:
-		gaokun_ec_psy_read_byte(ec, EC_LID_STATE, &status);
-		status &= EC_LID_OPEN;
-		input_report_switch(ec->idev, SW_LID, !status);
-		input_sync(ec->idev);
-		break;
+		case EC_EVENT_LID:
+			gaokun_ec_psy_read_byte(ec, EC_LID_STATE, &status);
+			status &= EC_LID_OPEN;
+			input_report_switch(ec->idev, SW_LID, !status);
+			input_sync(ec->idev);
+			break;
 
-	default:
-		blocking_notifier_call_chain(&ec->notifier_list, id, ec);
+		default:
+			blocking_notifier_call_chain(&ec->notifier_list, id, ec);
+		}
 	}
+
+	dev_warn_ratelimited(&ec->client->dev,
+			     "EC event queue did not drain after %d queries\n",
+			     GAOKUN_EC_MAX_EVENT_QUERIES);
 
 	return IRQ_HANDLED;
 }
