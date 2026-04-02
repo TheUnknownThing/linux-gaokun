@@ -9,6 +9,7 @@
 #include <linux/auxiliary_bus.h>
 #include <linux/bitops.h>
 #include <linux/container_of.h>
+#include <linux/jiffies.h>
 #include <linux/mutex.h>
 #include <linux/module.h>
 #include <linux/notifier.h>
@@ -29,6 +30,7 @@
 #define GAOKUN_UCSI_REGISTER_DELAY	(3 * HZ)
 #define GAOKUN_UCSI_RETRY_DELAY		(10 * HZ)
 #define GAOKUN_UCSI_MAX_RETRIES		3
+#define GAOKUN_UCSI_USB_EVENT_GRACE	(2 * HZ)
 
 #define GAOKUN_CCX_MASK		GENMASK(1, 0)
 #define GAOKUN_MUX_MASK		GENMASK(3, 2)
@@ -112,6 +114,7 @@ struct gaokun_ucsi {
 	u8 num_ports;
 	u8 register_retries;
 	unsigned long pending_usb_acks;
+	unsigned long last_connector_jiffies;
 	int last_connector_idx;
 	bool ports_initialized;
 	bool notifier_registered;
@@ -325,6 +328,20 @@ static int gaokun_ucsi_refresh(struct gaokun_ucsi *uec, u8 *port_mask)
 	return 0;
 }
 
+static unsigned long gaokun_ucsi_typec_mux_mode(u8 mode)
+{
+	switch (mode) {
+	case DP_PIN_ASSIGN_C:
+		return TYPEC_DP_STATE_C;
+	case DP_PIN_ASSIGN_D:
+		return TYPEC_DP_STATE_D;
+	case DP_PIN_ASSIGN_E:
+		return TYPEC_DP_STATE_E;
+	default:
+		return TYPEC_STATE_SAFE;
+	}
+}
+
 static void gaokun_ucsi_handle_altmode(struct gaokun_ucsi_port *port)
 {
 	struct gaokun_ucsi *uec = port->ucsi;
@@ -339,7 +356,7 @@ static void gaokun_ucsi_handle_altmode(struct gaokun_ucsi_port *port)
 	int idx = port->idx;
 	int ret;
 
-	if (idx >= uec->ucsi->cap.num_connectors) {
+	if (idx >= uec->num_ports) {
 		dev_warn(uec->dev, "altmode port out of range: %d\n", idx);
 		return;
 	}
@@ -352,21 +369,7 @@ static void gaokun_ucsi_handle_altmode(struct gaokun_ucsi_port *port)
 	spin_unlock_irqrestore(&port->lock, flags);
 
 	if (port->typec_mux && svid == USB_SID_DISPLAYPORT) {
-		switch (mode) {
-		case DP_PIN_ASSIGN_C:
-			state.mode = TYPEC_DP_STATE_C;
-			break;
-		case DP_PIN_ASSIGN_D:
-			state.mode = TYPEC_DP_STATE_D;
-			break;
-		case DP_PIN_ASSIGN_E:
-			state.mode = TYPEC_DP_STATE_E;
-			break;
-		default:
-			state.mode = TYPEC_STATE_SAFE;
-			break;
-		}
-
+		state.mode = gaokun_ucsi_typec_mux_mode(mode);
 		dp_alt.svid = USB_TYPEC_DP_SID;
 		dp_alt.mode = USB_TYPEC_DP_MODE;
 		state.alt = &dp_alt;
@@ -376,8 +379,7 @@ static void gaokun_ucsi_handle_altmode(struct gaokun_ucsi_port *port)
 			dp_data.status |= DP_STATUS_HPD_STATE;
 		if (hpd_irq)
 			dp_data.status |= DP_STATUS_IRQ_HPD;
-		dp_data.conf = DP_CONF_UFP_U_AS_UFP_D |
-			       DP_CONF_SET_PIN_ASSIGN(mode);
+		dp_data.conf = DP_CONF_SET_PIN_ASSIGN(mode);
 		state.data = &dp_data;
 
 		ret = typec_mux_set(port->typec_mux, &state);
@@ -519,7 +521,7 @@ static void gaokun_ucsi_refresh_snapshot_trylock(struct gaokun_ucsi *uec)
 	u8 port_mask;
 	int ret;
 
-	if (!uec->ucsi_registered || !uec->ucsi->connector)
+	if (!uec->ucsi_registered)
 		return;
 
 	/*
@@ -556,7 +558,7 @@ static void gaokun_ucsi_altmode_notify_ind(struct gaokun_ucsi *uec,
 	int idx;
 	int ret;
 
-	if (!uec->ucsi_registered || !uec->ucsi->connector) {
+	if (!uec->ucsi_registered) {
 		/*
 		 * On MateBook E Go, early EC/UCSI activity indirectly shares
 		 * the same boot-time path as internal display bring-up. Touching
@@ -631,7 +633,7 @@ static void gaokun_ucsi_sync_initial_state(struct work_struct *work)
 	int idx;
 	int ret;
 
-	if (!uec->ucsi_registered || !uec->ucsi->connector)
+	if (!uec->ucsi_registered)
 		return;
 
 	/*
@@ -651,6 +653,33 @@ static void gaokun_ucsi_sync_initial_state(struct work_struct *work)
 	}
 
 	gaokun_ucsi_ack_updates_ppm_locked(uec, port_mask);
+}
+
+static bool gaokun_ucsi_should_handle_usb_event(struct gaokun_ucsi *uec)
+{
+	struct gaokun_ucsi_port *port;
+	unsigned long flags;
+	int idx;
+
+	if (gaokun_ucsi_pending_usb_mask(uec))
+		return true;
+
+	for (idx = 0; idx < uec->num_ports; idx++) {
+		port = &uec->ports[idx];
+
+		spin_lock_irqsave(&port->lock, flags);
+		if (port->svid == USB_SID_DISPLAYPORT) {
+			spin_unlock_irqrestore(&port->lock, flags);
+			return true;
+		}
+		spin_unlock_irqrestore(&port->lock, flags);
+	}
+
+	if (uec->last_connector_idx == GAOKUN_UCSI_NO_PORT_UPDATE)
+		return false;
+
+	return !time_is_before_jiffies(uec->last_connector_jiffies +
+					 GAOKUN_UCSI_USB_EVENT_GRACE);
 }
 
 /*
@@ -685,6 +714,9 @@ static int gaokun_ucsi_notify(struct notifier_block *nb,
 
 	switch (action) {
 	case EC_EVENT_USB:
+		if (!gaokun_ucsi_should_handle_usb_event(uec)) {
+			return NOTIFY_OK;
+		}
 		gaokun_ucsi_altmode_notify_ind(uec, true, true);
 		return NOTIFY_OK;
 
@@ -706,6 +738,7 @@ static int gaokun_ucsi_notify(struct notifier_block *nb,
 
 			port = &uec->ports[idx];
 			uec->last_connector_idx = idx;
+			uec->last_connector_jiffies = jiffies;
 			set_bit(idx, &uec->pending_usb_acks);
 			mod_delayed_work(system_wq, &port->usb_work, 2 * HZ);
 		}
