@@ -96,7 +96,7 @@ HIMAX_MAX_TX + HIMAX_MAX_RX) * 2)
 #define HIMAX_PANEL_REINIT_RETRIES			3
 #define HIMAX_PANEL_REINIT_DELAY_MS			50
 /* Let the panel and display pipeline settle before TDDI touch recovery. */
-#define HIMAX_PANEL_ENABLE_SETTLE_MS			300
+#define HIMAX_PANEL_ENABLE_SETTLE_MS			1000
 /* HIMAX SPI function select, 1st byte of any SPI command sequence */
 #define HIMAX_SPI_FUNCTION_READ				0xf3
 #define HIMAX_SPI_FUNCTION_WRITE			0xf2
@@ -129,6 +129,7 @@ struct himax_ts_data {
 	struct drm_panel_follower panel_follower;
 	struct delayed_work panel_reinit_work;
 	u8 touch_start_frames;
+	u8 idle_noise_frames;
 	bool touch_active;
 	struct himax_track {
 		bool active;
@@ -638,6 +639,7 @@ static void himax_release_all_touches(struct himax_ts_data *ts)
 {
 	memset(ts->tracks, 0, sizeof(ts->tracks));
 	ts->touch_start_frames = 0;
+	ts->idle_noise_frames = 0;
 	ts->touch_active = false;
 
 	if (ts->input_dev)
@@ -707,6 +709,15 @@ static int himax_hw_reinit_retry(struct himax_ts_data *ts, bool check_crc,
 	return ret;
 }
 
+static void himax_schedule_reinit(struct himax_ts_data *ts, unsigned int delay_ms)
+{
+	if (ts->shutting_down || !ts->panel_prepared || !ts->panel_enabled)
+		return;
+
+	mod_delayed_work(system_wq, &ts->panel_reinit_work,
+			 msecs_to_jiffies(delay_ms));
+}
+
 static void himax_power_down(struct himax_ts_data *ts)
 {
 	himax_release_all_touches(ts);
@@ -766,8 +777,7 @@ static int himax_panel_enabled(struct drm_panel_follower *follower)
 	ts->panel_enabled = true;
 	himax_unlock(ts);
 
-	mod_delayed_work(system_wq, &ts->panel_reinit_work,
-			 msecs_to_jiffies(HIMAX_PANEL_ENABLE_SETTLE_MS));
+	himax_schedule_reinit(ts, HIMAX_PANEL_ENABLE_SETTLE_MS);
 	return 0;
 }
 
@@ -883,6 +893,9 @@ static int hx83121a_gaokun_read_event_stack(struct himax_ts_data *ts)
 #define HIMAX_PEAK_QUALITY_MIN	0x300
 #define HIMAX_TOUCH_START_DEBOUNCE	2
 #define HIMAX_NEW_TOUCH_DEBOUNCE	2
+#define HIMAX_IDLE_NOISE_MAX_CONTACTS	2
+#define HIMAX_IDLE_NOISE_TRIGGER_FRAMES	12
+#define HIMAX_IDLE_NOISE_REINIT_DELAY_MS	20
 /*
  * Maximum squared XY distance allowed when matching a new detection to an
  * existing slot. A smaller value reduces close-finger slot swaps, but if it is
@@ -1292,14 +1305,35 @@ static irqreturn_t himax_ts_thread(int irq, void *data)
 	}
 
 	if (stable_cnt > 0 && !ts->touch_active) {
+		ts->idle_noise_frames = 0;
 		ts->touch_start_frames++;
 		if (ts->touch_start_frames < HIMAX_TOUCH_START_DEBOUNCE)
 			report_on = false;
 		else
 			ts->touch_active = true;
 	} else if (stable_cnt == 0) {
+		if (!ts->touch_active && cnt > 0 &&
+		    cnt <= HIMAX_IDLE_NOISE_MAX_CONTACTS &&
+		    !delayed_work_pending(&ts->panel_reinit_work)) {
+			if (ts->idle_noise_frames < U8_MAX)
+				ts->idle_noise_frames++;
+
+			if (ts->idle_noise_frames >= HIMAX_IDLE_NOISE_TRIGGER_FRAMES) {
+				dev_warn(ts->dev,
+					 "persistent idle ghost touches detected, reinitializing controller\n");
+				himax_release_all_touches(ts);
+				himax_schedule_reinit(ts,
+						     HIMAX_IDLE_NOISE_REINIT_DELAY_MS);
+				goto out_unlock;
+			}
+		} else {
+			ts->idle_noise_frames = 0;
+		}
+
 		ts->touch_start_frames = 0;
 		ts->touch_active = false;
+	} else {
+		ts->idle_noise_frames = 0;
 	}
 
 	/* 这里报告给系统的坐标数据可以通过 evtest 查看 */
