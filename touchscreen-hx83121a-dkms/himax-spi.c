@@ -93,10 +93,15 @@ HIMAX_MAX_TX + HIMAX_MAX_RX) * 2)
 
 /* SPI CS setup time */
 #define HIMAX_SPI_CS_SETUP_TIME				300
+#define HIMAX_BOOT_REINIT_RETRIES			6
+#define HIMAX_BOOT_REINIT_DELAY_MS			500
 #define HIMAX_PANEL_REINIT_RETRIES			3
 #define HIMAX_PANEL_REINIT_DELAY_MS			50
 /* Let the panel and display pipeline settle before TDDI touch recovery. */
 #define HIMAX_PANEL_ENABLE_SETTLE_MS			1000
+#define HIMAX_RESUME_REINIT_RETRIES			10
+#define HIMAX_RESUME_REINIT_DELAY_MS			300
+#define HIMAX_RESUME_REINIT_INITIAL_DELAY_MS		3000
 /* HIMAX SPI function select, 1st byte of any SPI command sequence */
 #define HIMAX_SPI_FUNCTION_READ				0xf3
 #define HIMAX_SPI_FUNCTION_WRITE			0xf2
@@ -120,6 +125,7 @@ struct himax_ts_data {
 	bool irq_enabled;
 	bool panel_prepared;
 	bool panel_enabled;
+	bool boot_initialized;
 	bool shutting_down;
 	struct gpio_desc *gpiod_rst;
 	struct device *dev;
@@ -127,7 +133,12 @@ struct himax_ts_data {
 	struct input_dev *input_dev;
 	struct touchscreen_properties props;
 	struct drm_panel_follower panel_follower;
-	struct delayed_work panel_reinit_work;
+	struct delayed_work recovery_work;
+	bool recovery_require_panel_active;
+	bool recovery_check_crc;
+	int recovery_retries;
+	unsigned int recovery_retry_delay_ms;
+	const char *recovery_reason;
 	u8 touch_start_frames;
 	u8 idle_noise_frames;
 	bool touch_active;
@@ -145,6 +156,7 @@ static int himax_disable_fw_reload(struct himax_ts_data *ts);
 static int himax_mcu_power_on_init(struct himax_ts_data *ts);
 static int himax_mcu_check_crc(struct himax_ts_data *ts, u32 start_addr,
 			       int reload_length, u32 *crc_result);
+static void himax_power_down(struct himax_ts_data *ts);
 
 /*
  * 1st byte is the spi function select, 2nd byte is the command belong to the
@@ -514,11 +526,6 @@ without_check:
 	return -EIO;
 }
 
-static int hx83102j_sense_off(struct himax_ts_data *ts, bool check_en)
-{
-	return himax_sense_off(ts, check_en);
-}
-
 /**
  * @sw_reset: true for software reset, false for hardware reset
  *     true: write IC to leave safe mode
@@ -570,7 +577,7 @@ static int hx83121a_chip_detect(struct himax_ts_data *ts)
 		return ret;
 	}
 
-	ret = hx83102j_sense_off(ts, false);
+	ret = himax_sense_off(ts, false);
 	if (ret)
 		return ret;
 
@@ -709,12 +716,69 @@ static int himax_hw_reinit_retry(struct himax_ts_data *ts, bool check_crc,
 	return ret;
 }
 
-static void himax_schedule_reinit(struct himax_ts_data *ts, unsigned int delay_ms)
+static bool himax_panel_recovery_allowed(struct himax_ts_data *ts)
 {
-	if (ts->shutting_down || !ts->panel_prepared || !ts->panel_enabled)
+	return !ts->shutting_down && ts->panel_prepared && ts->panel_enabled;
+}
+
+static void himax_recovery_work(struct work_struct *work)
+{
+	struct himax_ts_data *ts = container_of(to_delayed_work(work),
+						struct himax_ts_data, recovery_work);
+	unsigned long flags;
+	bool require_panel_active;
+	bool check_crc;
+	int retries;
+	unsigned int retry_delay_ms;
+	const char *reason;
+
+	spin_lock_irqsave(&ts->irq_lock, flags);
+	require_panel_active = ts->recovery_require_panel_active;
+	check_crc = ts->recovery_check_crc;
+	retries = ts->recovery_retries;
+	retry_delay_ms = ts->recovery_retry_delay_ms;
+	reason = ts->recovery_reason;
+	spin_unlock_irqrestore(&ts->irq_lock, flags);
+
+	himax_lock(ts);
+	if (ts->shutting_down ||
+	    (require_panel_active && !himax_panel_recovery_allowed(ts))) {
+		himax_unlock(ts);
+		return;
+	}
+
+	dev_info(ts->dev, "running deferred %s recovery\n", reason);
+	if (himax_hw_reinit_retry(ts, check_crc, retries, retry_delay_ms, reason) &&
+	    require_panel_active)
+		himax_power_down(ts);
+	himax_unlock(ts);
+}
+
+static void himax_cancel_recovery_work(struct himax_ts_data *ts)
+{
+	cancel_delayed_work_sync(&ts->recovery_work);
+}
+
+static void himax_schedule_recovery(struct himax_ts_data *ts,
+				    bool require_panel_active, bool check_crc,
+				    int retries, unsigned int delay_ms,
+				    unsigned int retry_delay_ms,
+				    const char *reason)
+{
+	unsigned long flags;
+
+	if (require_panel_active && !himax_panel_recovery_allowed(ts))
 		return;
 
-	mod_delayed_work(system_wq, &ts->panel_reinit_work,
+	spin_lock_irqsave(&ts->irq_lock, flags);
+	ts->recovery_require_panel_active = require_panel_active;
+	ts->recovery_check_crc = check_crc;
+	ts->recovery_retries = retries;
+	ts->recovery_retry_delay_ms = retry_delay_ms;
+	ts->recovery_reason = reason;
+	spin_unlock_irqrestore(&ts->irq_lock, flags);
+
+	mod_delayed_work(system_wq, &ts->recovery_work,
 			 msecs_to_jiffies(delay_ms));
 }
 
@@ -728,6 +792,7 @@ static int himax_panel_prepared(struct drm_panel_follower *follower)
 {
 	struct himax_ts_data *ts = container_of(follower, struct himax_ts_data,
 						panel_follower);
+	int ret = 0;
 
 	himax_lock(ts);
 	if (ts->shutting_down) {
@@ -736,31 +801,22 @@ static int himax_panel_prepared(struct drm_panel_follower *follower)
 	}
 
 	ts->panel_prepared = true;
-	himax_unlock(ts);
-
-	return 0;
-}
-
-static void himax_panel_reinit_work(struct work_struct *work)
-{
-	struct himax_ts_data *ts = container_of(to_delayed_work(work),
-						struct himax_ts_data,
-						panel_reinit_work);
-	int ret;
-
-	himax_lock(ts);
-	if (ts->shutting_down || !ts->panel_prepared || !ts->panel_enabled) {
-		himax_unlock(ts);
-		return;
+	if (!ts->boot_initialized) {
+		/*
+		 * Only the very first bring-up owns synchronous init here.
+		 * Panel-enabled recovery is still allowed afterward because
+		 * display-side reset can happen later in the bring-up sequence.
+		 */
+		ret = himax_hw_reinit_retry(ts, true,
+					    HIMAX_BOOT_REINIT_RETRIES,
+					    HIMAX_BOOT_REINIT_DELAY_MS,
+					    "boot");
+		if (!ret)
+			ts->boot_initialized = true;
 	}
-
-	ret = himax_hw_reinit_retry(ts, false,
-				    HIMAX_PANEL_REINIT_RETRIES,
-				    HIMAX_PANEL_REINIT_DELAY_MS,
-				    "panel");
-	if (ret)
-		himax_power_down(ts);
 	himax_unlock(ts);
+
+	return ret;
 }
 
 static int himax_panel_enabled(struct drm_panel_follower *follower)
@@ -777,7 +833,11 @@ static int himax_panel_enabled(struct drm_panel_follower *follower)
 	ts->panel_enabled = true;
 	himax_unlock(ts);
 
-	himax_schedule_reinit(ts, HIMAX_PANEL_ENABLE_SETTLE_MS);
+	himax_schedule_recovery(ts, true, false,
+				HIMAX_PANEL_REINIT_RETRIES,
+				HIMAX_PANEL_ENABLE_SETTLE_MS,
+				HIMAX_PANEL_REINIT_DELAY_MS,
+				"panel");
 	return 0;
 }
 
@@ -786,7 +846,7 @@ static int himax_panel_disabling(struct drm_panel_follower *follower)
 	struct himax_ts_data *ts = container_of(follower, struct himax_ts_data,
 						panel_follower);
 
-	cancel_delayed_work_sync(&ts->panel_reinit_work);
+	himax_cancel_recovery_work(ts);
 
 	himax_lock(ts);
 	ts->panel_enabled = false;
@@ -802,7 +862,7 @@ static int himax_panel_unpreparing(struct drm_panel_follower *follower)
 	struct himax_ts_data *ts = container_of(follower, struct himax_ts_data,
 						panel_follower);
 
-	cancel_delayed_work_sync(&ts->panel_reinit_work);
+	himax_cancel_recovery_work(ts);
 
 	himax_lock(ts);
 	ts->panel_enabled = false;
@@ -828,7 +888,7 @@ static ssize_t inplace_reset_store(struct device *dev,
 	if (!do_reset)
 		return count;
 
-	cancel_delayed_work_sync(&ts->panel_reinit_work);
+	himax_cancel_recovery_work(ts);
 
 	himax_lock(ts);
 	if (ts->shutting_down) {
@@ -1314,7 +1374,7 @@ static irqreturn_t himax_ts_thread(int irq, void *data)
 	} else if (stable_cnt == 0) {
 		if (!ts->touch_active && cnt > 0 &&
 		    cnt <= HIMAX_IDLE_NOISE_MAX_CONTACTS &&
-		    !delayed_work_pending(&ts->panel_reinit_work)) {
+		    !delayed_work_pending(&ts->recovery_work)) {
 			if (ts->idle_noise_frames < U8_MAX)
 				ts->idle_noise_frames++;
 
@@ -1322,8 +1382,11 @@ static irqreturn_t himax_ts_thread(int irq, void *data)
 				dev_warn(ts->dev,
 					 "persistent idle ghost touches detected, reinitializing controller\n");
 				himax_release_all_touches(ts);
-				himax_schedule_reinit(ts,
-						     HIMAX_IDLE_NOISE_REINIT_DELAY_MS);
+				himax_schedule_recovery(ts, true, false,
+							HIMAX_PANEL_REINIT_RETRIES,
+							HIMAX_IDLE_NOISE_REINIT_DELAY_MS,
+							HIMAX_PANEL_REINIT_DELAY_MS,
+							"idle-noise");
 				goto out_unlock;
 			}
 		} else {
@@ -1563,7 +1626,7 @@ static int himax_spi_probe(struct spi_device *spi)
 
 	spin_lock_init(&ts->irq_lock);
 	mutex_init(&ts->op_lock);
-	INIT_DELAYED_WORK(&ts->panel_reinit_work, himax_panel_reinit_work);
+	INIT_DELAYED_WORK(&ts->recovery_work, himax_recovery_work);
 	dev_set_drvdata(&spi->dev, ts);
 	spi_set_drvdata(spi, ts);
 
@@ -1599,11 +1662,37 @@ static int himax_spi_probe(struct spi_device *spi)
 	return 0;
 }
 
+static int himax_spi_suspend(struct device *dev)
+{
+	struct himax_ts_data *ts = dev_get_drvdata(dev);
+
+	himax_cancel_recovery_work(ts);
+
+	himax_lock(ts);
+	himax_release_all_touches(ts);
+	himax_unlock(ts);
+
+	return 0;
+}
+
+static int himax_spi_resume(struct device *dev)
+{
+	struct himax_ts_data *ts = dev_get_drvdata(dev);
+
+	himax_schedule_recovery(ts, false, false,
+				HIMAX_RESUME_REINIT_RETRIES,
+				HIMAX_RESUME_REINIT_INITIAL_DELAY_MS,
+				HIMAX_RESUME_REINIT_DELAY_MS,
+				"resume");
+
+	return 0;
+}
+
 static void himax_spi_remove(struct spi_device *spi)
 {
 	struct himax_ts_data *ts = spi_get_drvdata(spi);
 
-	cancel_delayed_work_sync(&ts->panel_reinit_work);
+	himax_cancel_recovery_work(ts);
 
 	himax_lock(ts);
 	ts->shutting_down = true;
@@ -1628,10 +1717,14 @@ static const struct of_device_id himax_spi_of_match[] = {
 };
 MODULE_DEVICE_TABLE(of, himax_spi_of_match);
 
+static DEFINE_SIMPLE_DEV_PM_OPS(himax_spi_pm_ops,
+				himax_spi_suspend, himax_spi_resume);
+
 static struct spi_driver himax_spi_driver = {
 	.driver = {
 		.name = "himax-spi",
 		.of_match_table = himax_spi_of_match,
+		.pm = pm_sleep_ptr(&himax_spi_pm_ops),
 	},
 	.probe = himax_spi_probe,
 	.remove = himax_spi_remove,
